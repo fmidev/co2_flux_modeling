@@ -10,8 +10,8 @@ which were installed with the Miniconda installer, available here:
 https://docs.conda.io/en/latest/miniconda.html
 
 The conda-forge repository was used to install the libraries:
-`conda install -c conda-forge python=3.7.6 numpy=1.18.1 scipy=1.4.1 matplotlib=3.1.2
-    xarray=0.13.0 netCDF4=1.5.3 bottleneck=1.3.0 dask=2.8.0 seaborn=0.11.1 pandas=0.25.3
+`conda install -c conda-forge python=3.7.6 numpy=1.18.1 scipy=1.4.1 matplotlib=3.1.2 
+    xarray=0.13.0 netCDF4=1.5.3 bottleneck=1.3.0 dask=2.8.0 seaborn=0.11.1 pandas=0.25.3 
     scikit-learn=0.21.3 xgboost=1.2.0`
 
 For downloading the ERA5 data the CDS API client needs to be installed with pip:
