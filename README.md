@@ -29,7 +29,10 @@ Running the file in Unix:
 `./run_download_and_preprocess_data.sh`
 
 ## Running the experiments and analyses
-Make sure the folder paths are correctly defined inside the Python scripts prior to running them. 
+Unzip the CO2 observations (smeardata_20210224_set1.zip) and place the file in a suitable location,
+for example in the same folder where the code is.
+
+Make sure the folder paths are correctly defined inside the Python scripts prior to running them.  
 
 First run the preprocessing script:
 `python fit_optim.py`
