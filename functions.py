@@ -321,3 +321,19 @@ def fit_ensemble(X_trn, Y_trn, X_val, Y_val, base_estim,
 
 
 
+
+# --- Misc ---
+
+
+def stopwatch(start_stop, t=-99):
+    import time
+    
+    if start_stop=='start':
+        t = time.time()
+        return t
+    
+    if start_stop=='stop':
+        elapsed = time.time() - t
+        return time.strftime("%H hours, %M minutes, %S seconds",time.gmtime(elapsed))
+
+
