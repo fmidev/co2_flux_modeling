@@ -66,6 +66,28 @@ def calc_corr(a, b, axis=0):
 # --- Manipulators ---
 
 
+def Gauss_filter(data, sigma=(0,1,1), mode='wrap'):
+    """ Smooth data (spatially in 3D as default) using Gaussian filter """   
+    import scipy.ndimage.filters as flt
+    
+    try: data=data.values
+    except: pass
+    
+    U=data.copy()
+    V=data.copy()
+    V[np.isnan(U)]=0
+    VV=flt.gaussian_filter(V,sigma=sigma, mode=mode)
+
+    W=0*U.copy()+1
+    W[np.isnan(U)]=0
+    WW=flt.gaussian_filter(W,sigma=sigma, mode=mode)
+
+    Z=VV/WW
+    Z[np.isnan(U)] = np.nan
+    
+    return Z
+    
+
 
 def kz_filter(da, window, iterations, center=True):
     """
