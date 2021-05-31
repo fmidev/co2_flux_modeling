@@ -107,6 +107,10 @@ def transform_to_normal_distribution(data, output_dist='normal', nq=1000):
 
 # --- Reading and data extraction ---
 
+def bool_index_to_int_index(bool_index):
+    return np.where(bool_index)[0]
+
+
 
 def combine_and_define_lags(ds, lags, all_yrs):
     
