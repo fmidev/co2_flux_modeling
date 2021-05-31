@@ -35,10 +35,10 @@ for example in the same folder where the code is.
 Make sure the folder paths are correctly defined inside the Python scripts prior to running them.  
 
 First run the preprocessing script:
-`python fit_optim.py`
+`python preprocess.py`
 
 Then the fitting part:
-`python preprocess.py`
+`python fit_optim.py`
 
 Finally the analysis and plotting:
 `python analyse_results.py`
