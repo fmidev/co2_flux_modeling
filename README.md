@@ -2,11 +2,19 @@
 
 This code reproduces the data and experiments presented in 
 
-`Kämäräinen et al.: Modeling the sub-daily variability of the CO2 flux with machine learning`
+`Kämäräinen et al.: Modeling the sub-daily variability of the atmosphere–forest CO2 flux with machine learning`
+
+## System requirements
+The code was developed in the UNIX/Linux environment using Python 3.7.6.
+
+Running the code takes 2–4 hours with 40 CPU cores and ~ 100Gb RAM.
+Running it should be possible with considerably smaller resources, but
+the run time will increase accordingly. To ease the computing, change
+the `num_parallel_tree` parameter from 10 to 1 in fit_optim.py. Be aware 
+that this will change the results to some extent.
 
 ## Dependencies
-The code was developed in the UNIX/Linux environment using Python 3.7.6 and several external libraries,
-which were installed with the Miniconda installer, available here:
+Several external Python libraries were installed with the Miniconda installer, available here:
 https://docs.conda.io/en/latest/miniconda.html
 
 The conda-forge repository was used to install the libraries:
