@@ -28,7 +28,7 @@ For downloading the ERA5 data the CDS API client needs to be installed with pip:
 Also, follow these instructions to set up the CDS API key to your home folder:
 https://cds.climate.copernicus.eu/api-how-to
 
-## Downloading the input data  
+## Downloading the predictor data  
 For downloading the ERA5 data, run the run_download_era5.sh Unix shell file. Prior to running 
 the file, make sure that your miniconda environment is actvated, that the folder structures 
 are correctly defined inside the files, and that all Python dependencies are installed. 
@@ -37,7 +37,7 @@ Running the file in Unix:
 `./run_download_and_preprocess_data.sh`
 
 ## Running the experiments and analyses
-Unzip the CO2 observations (smeardata_20210224_set1.zip) and place the file in a suitable location,
+Unzip the CO2 observations (smeardata.zip) and place the file in a suitable location,
 for example in the same folder where the code is.
 
 Make sure the folder paths are correctly defined inside the Python scripts prior to running them.  
