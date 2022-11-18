@@ -51,8 +51,8 @@ for year in years:
         
         opts = {
                 'product_type'  : 'reanalysis',  
-                'grid'          : '1/1',
-                'area'          : [70, 15, 45, 40],
+                #'grid'          : '1/1',
+                'area'          : [66, 15, 55, 32], #[70, 15, 45, 40],
                 'variable'      : name2code[varname], 
                 'year'          : '%04d' % (year),
                 'month'         : ['%02d' % (i+1) for i in range(12)], 

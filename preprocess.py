@@ -14,15 +14,22 @@ import xarray as xr
 
 
 
-
+'''
 code_dir='/path/to/code/'
 data_dir='/path/to/data/'
 rslt_dir='/path/to/results/'
 
 era5_dir='/path/to/ERA5_data/'
+'''
 
 
 
+
+code_dir='/users/kamarain/ATMDP-003/'
+data_dir='/fmi/scratch/project_2002138/ATMDP-003/'
+rslt_dir='/fmi/scratch/project_2002138/ATMDP-003/'
+
+era5_dir='/fmi/scratch/project_2002138/ERA-5_0p25deg/'
 
 
 
@@ -83,7 +90,7 @@ era5_data = xr.merge([
 
 
 
-era5_data.chunk({'time':100}).to_netcdf(data_dir+'era5_preprocessed.nc')
+era5_data.chunk({'time':100}).to_netcdf(data_dir+'era5_preprocessed_0p25deg.nc')
 
 
 
