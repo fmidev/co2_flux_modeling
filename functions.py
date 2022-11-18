@@ -36,6 +36,30 @@ def calc_bootstrap(obs,fcs,func, bootstrap_range, B):
 
 
 
+
+def calc_nses(obs,mod):
+    return 1-(np.nansum((obs-mod)**2)/np.nansum((obs-np.nanmean(mod))**2))
+
+
+
+def calc_r2ss(obs,mod,multioutput='raw_values'): 
+    from sklearn.metrics import r2_score
+    
+    mask_o = np.isnan(obs) | np.isinf(obs)
+    mask_m = np.isnan(mod) | np.isinf(mod)
+    mask = mask_o + mask_m
+    
+    if len(obs[~mask]) == 0 or len(mod[~mask]) == 0: 
+        result = np.nan
+    else:
+        result = r2_score(obs[~mask], mod[~mask])#, multioutput=multioutput)
+    
+    return np.squeeze(result)
+
+
+
+
+
 def calc_rmse(a,b,axis=0): 
     return np.sqrt(np.nanmean((a-b)**2, axis=axis))
 
@@ -43,6 +67,7 @@ def calc_mse(a,b,axis=0):
     return np.nanmean((a-b)**2, axis=axis)
     
 
+    
 
 def calc_corr(a, b, axis=0):
     mask_a = np.isnan(a) | np.isinf(a)
@@ -62,6 +87,21 @@ def calc_corr(a, b, axis=0):
     return np.nanmean(_a * _b, axis=axis)/(std_a*std_b)
 
 
+
+
+
+def extract_shap_values(X_test, model):
+    import shap
+    
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_test)
+
+    data = pd.DataFrame(np.abs(shap_values).mean(axis=0), index=list(X_test.columns))
+    data = data.sort_values(by=0,ascending=False)
+    sorted_names, sorted_importance = np.flipud(list(data.index)), np.flipud(data.values.squeeze())
+    
+    return sorted_names, sorted_importance
+    
 
 # --- Manipulators ---
 
@@ -285,7 +325,63 @@ def read_and_select(in__dir, name_out,source, fles, var, domains,out_resol, mask
 
 
 
-# --- Model fitting ---
+# --- Model fitting and optimization ---
+
+
+
+
+def fit_optimize(approach, default_params, param_grid, X_trn, Y_trn, optimize=True):
+    
+    from skopt import BayesSearchCV
+    from sklearn.model_selection import KFold
+    
+    
+    if approach == 'RF':
+        default_params['n_estimators'] = 1
+        default_params['learning_rate'] = 1
+    
+    if approach == 'GB':
+        default_params['num_parallel_tree'] = 1
+    
+    
+    default_params['num_parallel_tree'] = int(default_params['num_parallel_tree'])
+    default_params['n_estimators'] = int(default_params['n_estimators'])
+    default_params['max_depth'] = int(default_params['max_depth'])
+    
+    if optimize:
+        optBayes = BayesSearchCV(estimator=define_xgb(default_params), search_spaces=param_grid, 
+                                            n_iter=50, scoring='neg_mean_squared_error', 
+                                            cv=KFold(5, shuffle=False), n_points=3, pre_dispatch=6, 
+                                            n_jobs=40, return_train_score=True, verbose=0, )
+        
+        print('Optimizing',approach,'– total number of iterations:',optBayes.total_iterations)
+        
+        optBayes.fit(X_trn, Y_trn, eval_metric='rmse')
+        ensemble = optBayes.best_estimator_
+    
+    if not optimize:
+        optBayes = np.nan
+        
+        ensemble = define_xgb(default_params)
+        ensemble.fit(X_trn, Y_trn, eval_metric='rmse', verbose=10)
+    
+    return ensemble, optBayes
+
+
+
+
+def define_xgb(default_params):
+    import xgboost as xgb
+    
+    base_estim = xgb.XGBRegressor(
+        objective='reg:squarederror',
+        random_state=99,
+        **default_params)
+    
+    return base_estim
+
+
+
 
 
 def fit_ensemble(X_trn, Y_trn, X_val, Y_val, base_estim, 
@@ -337,5 +433,42 @@ def stopwatch(start_stop, t=-99):
     if start_stop=='stop':
         elapsed = time.time() - t
         return time.strftime("%H hours, %M minutes, %S seconds",time.gmtime(elapsed))
+
+
+
+
+
+def format_axes(ax):
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import NullFormatter
+    
+    # Y-axis
+    #max_yticks = 7; yloc = plt.MaxNLocator(max_yticks, integer=True)
+    #ax.yaxis.set_major_locator(yloc)
+    
+    # X-axis
+    #ax.xaxis.set_minor_locator('off')
+    #ax.xaxis.set_minor_locator(mdates.DayLocator(interval=1))
+    #xfmt = mdates.DateFormatter('%d %a')
+    #xfmt = mdates.DateFormatter('')
+    #ax.xaxis.set_minor_formatter(xfmt)
+    
+    #ax.xaxis.set_major_locator(mdates.MonthLocator(bymonthday=1,interval=1))
+    #xfmt = mdates.DateFormatter('%b')
+    #ax.xaxis.set_major_formatter(xfmt)
+    
+    # Ticks
+    #ax.tick_params(direction='out', length=2, width=0.1, which='both')
+    #ax.xaxis.set_major_locator(mdates.MonthLocator())
+    #ax.xaxis.set_major_formatter(NullFormatter())
+    #ax.xaxis.set_minor_locator(mdates.MonthLocator(bymonthday=15, interval=1))
+    #ax.xaxis.set_minor_formatter(mdates.DateFormatter('%b'))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
+    
+    pass
+
+
+
 
 

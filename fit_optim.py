@@ -3,7 +3,7 @@
 
 
 # Read modules
-import sys, ast, importlib, datetime
+import sys, ast, importlib, datetime, glob, itertools
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -13,11 +13,12 @@ import xarray as xr
 
 import xgboost as xgb
 
-
+from skopt import BayesSearchCV
+from skopt.space import Real, Integer
 
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, RepeatedKFold
 from sklearn.utils import resample
 from sklearn.model_selection import train_test_split
 
@@ -30,6 +31,9 @@ from sklearn.model_selection import train_test_split
 
 
 '''
+
+
+
 code_dir='/path/to/code/'
 data_dir='/path/to/data/'
 rslt_dir='/path/to/results/'
@@ -37,12 +41,31 @@ rslt_dir='/path/to/results/'
 era5_dir='/path/to/ERA5_data/'
 
 
-'''
 code_dir='/users/kamarain/ATMDP-003/'
 data_dir='/fmi/scratch/project_2002138/ATMDP-003/'
 rslt_dir='/fmi/scratch/project_2002138/ATMDP-003/'
+approach='GB'
+shuffle=True
 
-era5_dir='/fmi/scratch/project_2002138/ERA-5_1p0deg/'
+
+
+'''
+
+code_dir = str(sys.argv[1])+'/'
+data_dir = str(sys.argv[2])+'/'
+rslt_dir = str(sys.argv[3])+'/'
+approach = str(sys.argv[4])
+
+# Whether to shuffle the additional in-sample samples (sub-samples)
+shuffle  = ast.literal_eval(sys.argv[5])
+
+# Whether to use standard or repeated KFold cross-validation
+repeat = True
+n_repeats = 8
+
+# File identifier
+idnt = approach+'_shuffle='+str(shuffle)
+
 
 
 
@@ -53,25 +76,65 @@ import functions as fcts
 
 
 
-
-# Modeling approach. Random forest ='rfrs'; Gradient boosting = 'gbst'
-appr = 'gbst' # 'rfrs' 'gbst'
-
-# Whether to shuffle the additional in-sample samples
-sffl = True  # False  True
+# Optimized/Initial model parameters for Gradient boosting or Random forest
+param_df = pd.read_csv(data_dir+'best_params_Bayes_optim_1_'+idnt+'.csv', usecols=['param','value'])
+params = dict(param_df.values)
 
 
 
+params['n_jobs'] = 40
+params['max_depth'] = int(params['max_depth'])
 
-idnt = appr+'_shuffle='+str(sffl)
 
 
-#'rfrs_noShfl' # 'rfrs_noShfl' 'gbst_noShfl' 'rfrs_whfl' 'gbst_wShfl'
+
+
+if approach == 'GB':
+    params['num_parallel_tree'] = 1
+    params['n_estimators'] = 500
+    
+    # Define the search space for Bayesian optimization
+    param_grid =    {
+                    'learning_rate':         Real(0.01, 0.7, 'log-uniform'),
+                    'max_depth':             Integer(3, 18),
+                    'n_estimators':          Integer(10,1000),
+                    'subsample':             Real(0.01, 1.0,  'uniform'),
+                    'colsample_bytree':      Real(0.01, 1.0,  'uniform'),
+                    'reg_alpha':             Real(1e-9, 1.0,  'log-uniform'),
+                    }
+
+
+
+if approach == 'RF':
+    params['num_parallel_tree'] = 500
+    params['n_estimators'] = 1
+    params['learning_rate'] = 1
+    
+    # Define the search space for Bayesian optimization
+    param_grid =    {
+                    'max_depth':             Integer(3, 18),
+                    'num_parallel_tree':     Integer(10,1000),
+                    'subsample':             Real(0.01, 1.0,  'uniform'),
+                    'colsample_bynode':      Real(0.01, 1.0,  'uniform'), 
+                    'reg_alpha':             Real(1e-9, 1.0,  'log-uniform'),
+                    }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
 # Target data 
-#obs = pd.read_csv(data_dir+'smeardata_20210224_set1.csv')
 obs = pd.read_csv(data_dir+'smeardata_20220130_gapfilled.csv')
 gap = pd.read_csv(data_dir+'smeardata_20220130_gapfill_method.csv')
 
@@ -82,9 +145,7 @@ obs.index = pd.to_datetime(obs[['Year','Month','Day','Hour','Minute','Second']])
 obs.index.name = 'time'
 
 # Resampling to 6H, skip samples containing NaNs
-#obs = obs[['HYY_EDDY233.F_c']].resample('6H').agg(pd.Series.mean, skipna=False)
 obs = obs[['HYY_EDDY233.NEE']].resample('6H').agg(pd.Series.mean, skipna=False)
-#obs = obs[['HYY_EDDY233.NEE']].resample('1H').agg(pd.Series.mean, skipna=False)
 
 vrb = obs.columns[0]
 
@@ -106,15 +167,17 @@ vrb = obs.columns[0]
 
 
 
-dropout = ['tcc', 'msl', 'tp', 'swvl1','swvl2','u10','swvl3','v10','r','z','sd','mslhf','e','stl2','stl3','t2m','msdrswrf','stl1'] 
-dropout = [] 
+
+dropout = ['z','swvl2','msl','sd','swvl3','swvl1','tcc','stl2','tp','stl3','mslhf','v10','u10','stl1','r','msdrswrf','e','msshf','t2m',] 
+dropout = ['z','swvl2','msl','sd','swvl3','swvl1','tcc','stl2','tp'] 
 #'tcc', 'msl', 'tp', 'swvl1','swvl2','u10','swvl3','v10','r','z','sd','mslhf','e','stl2','stl3','t2m','msdrswrf','stl1'
 
 # Read ERA5 predictor data
-era5_data = xr.open_dataset(data_dir+'era5_preprocessed.nc').sel(
+dDeg = 0.6; lat_h=61.85; lon_h=24.283
+era5_data = xr.open_dataset(data_dir+'era5_preprocessed_0p25deg.nc').sel(
     time=slice('1996-01-01', '2020-12-31'), 
-    lat=slice(60,64),
-    lon=slice(22,26)
+    lat=slice(lat_h - dDeg, lat_h + dDeg), #lat=slice(60,64),
+    lon=slice(lon_h - dDeg, lon_h + dDeg), #lon=slice(22,26)
     ).drop(dropout)
 
 
@@ -131,36 +194,46 @@ for predictor in list(era5_data.data_vars.keys()):
 
 for predictor in list(era5_data.data_vars.keys()):
     era5_data[predictor].mean(axis=(0)).plot(); plt.show()
-'''
 
 
 
 
 
 
-# Define model parameters
+
+# 
+
+# Define model parameters for Gradient boosting
 if appr == 'gbst':
-    num_parallel_tree = 10 # 1 # 10
-    max_depth = 7
-    subsample=0.75
-    colsample_bytree=0.75
-    colsample_bynode=1
-    early_stopping = True
-    nstm = 500
-    lrte = 0.075
+    param_df = pd.read_csv(data_dir+'best_params_Bayes_optim_10.csv', usecols=['param','value'])
+    params = dict(param_df.values)
+    
+    
+    params = {
+        'n_jobs': 10,
+        'num_parallel_tree': 1, # 1 # 10
+        'max_depth': 7,
+        'subsample': 0.75,
+        'colsample_bytree': 0.75,
+        'colsample_bynode': 1,
+        'n_estimators': 200,
+        'learning_rate': 0.075 }
+    
 
+
+# Define model parameters for Random forest
 if appr == 'rfrs':
-    num_parallel_tree = 500
-    max_depth = 14
-    subsample=0.50
-    colsample_bytree=1
-    colsample_bynode=0.50
-    early_stopping = False
-    nstm = 1
-    lrte = 1
+    params = {
+        'num_parallel_tree': 500, 
+        'max_depth': 14,
+        'subsample': 0.50,
+        'colsample_bytree': 1,
+        'colsample_bynode': 0.50,
+        'n_estimators': 1 }
+    
 
 
-
+'''
 
 
 
@@ -175,9 +248,6 @@ all_yrs   = np.arange(1996,2021).astype(int)
 
 
 
-
-models  = []
-vld_yrs = []
 
 
 t_axis = pd.date_range('1996-01-01', '2019-01-01', freq='6H')
@@ -204,7 +274,7 @@ not_nans = ~nans
 
 # Define and apply the quantile model for predictand
 transformed, qt_model = fcts.transform_to_normal_distribution(
-                Z[vrb].loc[not_nans].values[:,np.newaxis], 'normal',100000)
+                Z[vrb].loc[not_nans].values[:,np.newaxis], 'normal',10000)
 
 
 
@@ -214,25 +284,31 @@ Z[vrb+'_qt'].loc[not_nans] = transformed.squeeze()
 
 # Additional in-sample sampling to study the sensitivity of the model on the size of fitting data
 sample_sizes = np.arange(0.1,1.01,0.1)
-sample_sizes = [1.0]
+#sample_sizes = [1.0]
 
 
 for ss in sample_sizes:
-    Z['fcs_'+str(int(ss*100))]  = np.nan
+    Z['fcs_0_'+str(int(ss*100))]  = np.nan
+    Z['ctr_0_'+str(int(ss*100))]  = np.nan
+
+
+if repeat:
+    for rpt in range(n_repeats):
+        for ss in sample_sizes:
+            Z['fcs_'+str(rpt)+'_'+str(int(ss*100))]  = np.nan
+            Z['ctr_'+str(rpt)+'_'+str(int(ss*100))]  = np.nan
 
 
 
 
-
-
-
-# Prepare predictor matrix X 
+# Prepare predictor matrix X with spatial and temporal lags
 X    = fcts.combine_and_define_lags(era5_data, np.arange(-2,3), all_yrs=all_yrs)
 X.index = X.index.rename('time'); t_axis = X.index
 
 
-
-
+# Predictor data for a control experiment WITHOUT spatial or temporal lags
+C    = fcts.combine_and_define_lags(era5_data.sel(lat=61.85, lon=24.283, method='nearest'), [0], all_yrs=all_yrs)
+C.index = C.index.rename('time'); t_axis = C.index
 
 
 
@@ -243,7 +319,8 @@ X.index = X.index.rename('time'); t_axis = X.index
 # Make sure the same time steps are in X and in target Z and they are synchronized
 X_time = X.index.values; Z_time = Z.index.values
 X_in_Z = np.isin(Z_time, X_time); Z_in_X = np.isin(X_time, Z_time)
-X = X.loc[Z_in_X]; Z = Z.loc[X_in_Z]
+X = X.loc[Z_in_X]; C = C.loc[Z_in_X]; Z = Z.loc[X_in_Z]
+
 
 
 
@@ -251,13 +328,35 @@ X = X.loc[Z_in_X]; Z = Z.loc[X_in_Z]
 
 
 # Fit models in cross-validation framework
-kf = KFold(5, shuffle=True); fold = 0
+
+
+
+#models_full_model  = []; models_ctrl_model  = []
+#vld_yrs = []
+
+
+if repeat:
+    kf = RepeatedKFold(n_splits=5, n_repeats=n_repeats, random_state=99)
+else:
+    kf = KFold(n_splits=5, shuffle=True, random_state=99) 
+
+
+
+fold = 0
+split_count=0
 for trn_idx, tst_idx in kf.split(all_yrs):
-    fold += 1
+    
+    if repeat:
+        fold = np.mod(split_count,5) + 1
+        rept = np.floor_divide(split_count,5) 
+    else:
+        fold += 1
+        rept = 0
+    
     tst_yrs = all_yrs[tst_idx]
     trn_yrs = all_yrs[trn_idx]
-    print(trn_yrs, tst_yrs)
-    vld_yrs.append(tst_yrs)
+    print(fold,trn_yrs, tst_yrs)
+    #vld_yrs.append(tst_yrs)
     
     t = fcts.stopwatch('start')
     fcts=importlib.reload(fcts)
@@ -282,92 +381,172 @@ for trn_idx, tst_idx in kf.split(all_yrs):
     t_common_tst = np.intersect1d(t_Z_tst, t_X_tst)
     
     for ss in sample_sizes:
-        # Define the model
-        base_estim = xgb.XGBRegressor(
-            objective='reg:squarederror',
-            n_estimators=nstm,  
-            learning_rate=lrte, 
-            max_depth=max_depth,
-            alpha=0.01,
-            num_parallel_tree=num_parallel_tree,
-            n_jobs=40, 
-            subsample=subsample, 
-            colsample_bytree=colsample_bytree,  
-            colsample_bynode=colsample_bynode,  
-            random_state=99)
         
         #sample_size = int(len(X.loc[t_common_fit])*ss)
         #t_fit_sampled = resample(t_common_fit, replace=False, n_samples=sample_size)
         if ss==1.0:
             smpl=0.999999999
+            optimize=True
         else:
             smpl=ss
+            optimize=False
         
-        t_fit_sampled, _ = train_test_split(t_common_fit, train_size=smpl, shuffle=sffl)
+        t_fit_sampled, _ = train_test_split(t_common_fit, train_size=smpl, shuffle=shuffle)
         
-        # Train
-        verbose=True
-        fitted_ensemble = fcts.fit_ensemble(
-            X.loc[t_fit_sampled], Z[vrb+'_qt'].loc[t_fit_sampled], 
-            X.loc[t_common_tst], Z[vrb+'_qt'].loc[t_common_tst], 
-            base_estim, 'rmse', verbose=True, early_stopping=early_stopping)
+        '''
+        # Optimize and fit full model
+        params['n_jobs'] = 10
+        fitted_ensemble, opt = fcts.fit_optimize(approach, params, param_grid, 
+                                        X.loc[t_fit_sampled], Z[vrb+'_qt'].loc[t_fit_sampled], optimize=optimize)
+        
+        # Fit control model
+        if optimize:
+            opt_params = opt.best_params_
+        else:
+            opt_params = params
+        
+        opt_params['n_jobs'] = 40
+        contrl_ensemble, _ = fcts.fit_optimize(approach, opt_params, param_grid, 
+                                        C.loc[t_fit_sampled], Z[vrb+'_qt'].loc[t_fit_sampled], optimize=False)
+        '''
+        
+        #'''
         
         
+        # Refit
+        opt_params = pd.read_csv(data_dir+'best_params_Bayes_optim_'+str(fold)+'_'+idnt+'.csv', usecols=['param','value'])
+        opt_params = dict(param_df.values)
+        opt_params['max_depth'] = int(opt_params['max_depth'])
+        opt_params['n_jobs'] = 40
+        
+        fitted_ensemble, _ = fcts.fit_optimize(approach, opt_params, param_grid, 
+                                        X.loc[t_fit_sampled], Z[vrb+'_qt'].loc[t_fit_sampled], optimize=False)        
+        contrl_ensemble, _ = fcts.fit_optimize(approach, opt_params, param_grid, 
+                                        C.loc[t_fit_sampled], Z[vrb+'_qt'].loc[t_fit_sampled], optimize=False)
+        
+        
+        #'''
+        
+        #'''
         if ss==1.0:
-            # Save the model if using full 100% sample size
-            models.append(fitted_ensemble)
-        
-        
-        print('Fitting',fold,ss,vrb,'took ' + fcts.stopwatch('stop', t))
+            print(ss)
+            
+            # Save the optimized model and parameters if using full 100% sample size
+            contrl_ensemble.save_model(data_dir+'cntrl_'+str(rept)+'_'+str(fold)+'_'+idnt+'.json')
+            fitted_ensemble.save_model(data_dir+'model_'+str(rept)+'_'+str(fold)+'_'+idnt+'.json')
+            '''
+            cv_reslts = pd.DataFrame(opt.cv_results_)
+            opt_parms = pd.DataFrame({  'param':list(opt.best_params_.keys()), 
+                                        'value':list(opt.best_params_.values())})
+            
+            cv_reslts.to_csv(data_dir+'cv_results_Bayes_optim_'+str(rept)+'_'+str(fold)+'_'+idnt+'.csv')
+            opt_parms.to_csv(data_dir+'best_params_Bayes_optim_'+str(rept)+'_'+str(fold)+'_'+idnt+'.csv')
+            '''
+            
+        #'''
+        print('Fitting and optimizing',approach,fold,ss,vrb,'took ' + fcts.stopwatch('stop', t))
         print(dropout)
         
         # Save the inverse transformed forecast
-        prediction = fitted_ensemble.predict(X.iloc[tst_idx_x].values)[:,np.newaxis]
-        Z['fcs_'+str(int(ss*100))].iloc[tst_idx_y] = qt_model.inverse_transform(prediction).squeeze() 
+        full_model_prediction = fitted_ensemble.predict(X.iloc[tst_idx_x].values)[:,np.newaxis]
+        ctrl_model_prediction = contrl_ensemble.predict(C.iloc[tst_idx_x].values)[:,np.newaxis]
         
+        Z['fcs_'+str(rept)+'_'+str(int(ss*100))].iloc[tst_idx_y] = qt_model.inverse_transform(full_model_prediction).squeeze() 
+        Z['ctr_'+str(rept)+'_'+str(int(ss*100))].iloc[tst_idx_y] = qt_model.inverse_transform(ctrl_model_prediction).squeeze() 
+    
+    
+    
+    split_count += 1
+
+
 
 
 
 not_nans = ~ np.isnan(Z[vrb]).values
 
-corr_6h = fcts.calc_corr(Z['fcs_100'].loc[not_nans], Z[vrb].loc[not_nans])
-rmse_6h = fcts.calc_rmse(Z['fcs_100'].loc[not_nans], Z[vrb].loc[not_nans])
 
-corr_1w = fcts.calc_corr(Z['fcs_100'].loc[not_nans].resample('1W').mean(), Z[vrb].loc[not_nans].resample('1W').mean())
-rmse_1w = fcts.calc_rmse(Z['fcs_100'].loc[not_nans].resample('1W').mean(), Z[vrb].loc[not_nans].resample('1W').mean())
+for rpt,d in itertools.product(range(n_repeats), ['fcs','ctr']):
+    cor_6h = fcts.calc_corr(Z[d+'_'+str(rpt)+'_100'].loc[not_nans], Z[vrb].loc[not_nans])
+    rms_6h = fcts.calc_rmse(Z[d+'_'+str(rpt)+'_100'].loc[not_nans], Z[vrb].loc[not_nans])
+    nse_6h = fcts.calc_nses(Z[d+'_'+str(rpt)+'_100'].loc[not_nans], Z[vrb].loc[not_nans])
+    r2s_6h = fcts.calc_r2ss(Z[d+'_'+str(rpt)+'_100'].loc[not_nans], Z[vrb].loc[not_nans])
+    
+    print(dropout)
+    print(  str(rpt)+' '+d+  ': cor_6h = '+str(cor_6h.round(4))+\
+                ' rms_6h = '+str(rms_6h.round(4))+\
+                ' nse_6h = '+str(nse_6h.round(4))+\
+                ' r2s_6h = '+str(r2s_6h.round(4)))
 
-print(dropout)
-print('CORR = '+str(corr_6h.round(3))+' RMSE = '+str(rmse_6h.round(3))+\
-      ' CORR-w = '+str(corr_1w.round(3))+' RMSE-w = '+str(rmse_1w.round(3)))
+
+
+'''
+fcs: cor_6h = 0.9545342 rms_6h = 1.2183495 nse_6h = 0.9056311 r2s_6h = [0.9056265]
+fcs: cor_1w = 0.9694754 rms_1w = 0.7801227 nse_1w = 0.9390132 r2s_1w = [0.9390129]
+ctr: cor_6h = 0.8515796 rms_6h = 2.2082477 nse_6h = 0.4915807 r2s_6h = [0.4837893]
+ctr: cor_1w = 0.928645  rms_1w = 1.2732213 nse_1w = 0.774461  r2s_1w = [0.7689431]
+'''
 
 
 
 
+'''
+ctrl_model_prediction = contrl_ensemble.predict(C.iloc[tst_idx_x], output_margin=True)[:,np.newaxis]
+
+explainer = shap.TreeExplainer(contrl_ensemble)
+shap_values = explainer.shap_values(C.iloc[tst_idx_x])
+np.abs(shap_values.sum(1) + explainer.expected_value - ctrl_model_prediction).max()
+
+shap.summary_plot(shap_values, C.iloc[tst_idx_x], plot_type='violin')
+shap.summary_plot(shap_values, C.iloc[tst_idx_x], plot_type='bar')
+
+#shap.force_plot(explainer.expected_value, shap_values, C.iloc[tst_idx_x])
+
+shap.plots.bar(shap_values, C.iloc[tst_idx_x])
+
+
+shap.plots.bar(shap_values[0])
+'''
+
+
+
+
+# CORR = 0.955 RMSE = 1.217 CORR-w = 0.969 RMSE-w = 0.788
 
 
 
 # Save modeled results and models
 Z.drop(columns=[vrb+'_qt']).to_csv(data_dir+'obs_mod_co2_'+idnt+'.csv')
 
-for i,mdl in enumerate(models):
-    mdl.save_model(data_dir+'model_'+str(i+1)+'_for_co2_'+idnt+'.json')
-
-
-
-
-
-# Random forest hyperparameter optimization
-# num_parallel_tree = 500	max_depth = 7	subsample=0.75	colsample_bytree=1	colsample_bynode=0.75			CORR=0.9309886416726332
-# num_parallel_tree = 500	max_depth = 7	subsample=0.75	colsample_bytree=1	colsample_bynode=0.75			CORR=0.9332979935060194
-# num_parallel_tree = 500	max_depth = 7	subsample=0.75	colsample_bytree=1	colsample_bynode=0.75			CORR=0.9331501211149369
-# num_parallel_tree = 500	max_depth = 9	subsample=0.50	colsample_bytree=1	colsample_bynode=0.50			CORR=0.9373346857507269
-# num_parallel_tree = 500	max_depth = 11	subsample=0.50	colsample_bytree=1	colsample_bynode=0.50			CORR=0.9385038499464846
-# num_parallel_tree = 500	max_depth = 14	subsample=0.50	colsample_bytree=1	colsample_bynode=0.50			CORR=0.9386975750903893
-
 
 
 
 # New Dropout experiment
+# -                                                                                     fcs: cor_6h = 0.9540 rms_6h = 1.2255 nse_6h = 0.9041 r2s_6h = 0.9041
+# - z:                                                                                  fcs: cor_6h = 0.9535 rms_6h = 1.2322 nse_6h = 0.9029 r2s_6h = 0.9029
+# - z,swvl2:                                                                            fcs: cor_6h = 0.9539 rms_6h = 1.2262 nse_6h = 0.9040 r2s_6h = 0.9040
+# - z,swvl2,msl:                                                                        fcs: cor_6h = 0.9540 rms_6h = 1.2258 nse_6h = 0.9045 r2s_6h = 0.9045
+# - z,swvl2,msl,sd:                                                                     fcs: cor_6h = 0.9540 rms_6h = 1.2257 nse_6h = 0.9038 r2s_6h = 0.9038
+# - z,swvl2,msl,sd,swvl3:                                                               fcs: cor_6h = 0.9543 rms_6h = 1.2220 nse_6h = 0.9053 r2s_6h = 0.9053
+# - z,swvl2,msl,sd,swvl3,swvl1:                                                         fcs: cor_6h = 0.9547 rms_6h = 1.2166 nse_6h = 0.9066 r2s_6h = 0.9066
+# - z,swvl2,msl,sd,swvl3,swvl1,tcc:                                                     fcs: cor_6h = 0.9555 rms_6h = 1.2070 nse_6h = 0.9080 r2s_6h = 0.9080
+
+# - z,swvl2,msl,sd,swvl3,swvl1,tcc,stl2:                                                fcs: cor_6h = 0.9550 rms_6h = 1.2129 nse_6h = 0.9070 r2s_6h = 0.9070
+# - z,swvl2,msl,sd,swvl3,swvl1,tcc,stl2,tp:                                             fcs: cor_6h = 0.9551 rms_6h = 1.2120 nse_6h = 0.9076 r2s_6h = 0.9076
+# - z,swvl2,msl,sd,swvl3,swvl1,tcc,stl2,tp,stl3:                                        fcs: cor_6h = 0.9550 rms_6h = 1.2142 nse_6h = 0.9074 r2s_6h = 0.9074
+# - z,swvl2,msl,sd,swvl3,swvl1,tcc,stl2,tp,stl3,mslhf:                                  fcs: cor_6h = 0.9550 rms_6h = 1.2136 nse_6h = 0.9073 r2s_6h = 0.9073
+# - z,swvl2,msl,sd,swvl3,swvl1,tcc,stl2,tp,stl3,mslhf,v10:                              fcs: cor_6h = 0.9540 rms_6h = 1.2261 nse_6h = 0.9052 r2s_6h = 0.9052
+
+# - z,swvl2,msl,sd,swvl3,swvl1,tcc,stl2,tp,stl3,mslhf,v10,u10:                          fcs: cor_6h = 0.9531 rms_6h = 1.2388 nse_6h = 0.9032 r2s_6h = 0.9032
+# - z,swvl2,msl,sd,swvl3,swvl1,tcc,stl2,tp,stl3,mslhf,v10,u10,stl1:                     fcs: cor_6h = 0.9526 rms_6h = 1.2442 nse_6h = 0.9022 r2s_6h = 0.9022
+# - z,swvl2,msl,sd,swvl3,swvl1,tcc,stl2,tp,stl3,mslhf,v10,u10,stl1,r:                   fcs: cor_6h = 0.9491 rms_6h = 1.2903 nse_6h = 0.8950 r2s_6h = 0.8950
+# - z,swvl2,msl,sd,swvl3,swvl1,tcc,stl2,tp,stl3,mslhf,v10,u10,stl1,r,msdrswrf:          fcs: cor_6h = 0.9463 rms_6h = 1.3241 nse_6h = 0.8889 r2s_6h = 0.8889
+# - z,swvl2,msl,sd,swvl3,swvl1,tcc,stl2,tp,stl3,mslhf,v10,u10,stl1,r,msdrswrf,e:        fcs: cor_6h = 0.9387 rms_6h = 1.4114 nse_6h = 0.8724 r2s_6h = 0.8724
+# - z,swvl2,msl,sd,swvl3,swvl1,tcc,stl2,tp,stl3,mslhf,v10,u10,stl1,r,msdrswrf,e,msshf:  fcs: cor_6h = 0.8951 rms_6h = 1.8277 nse_6h = 0.7662 r2s_6h = 0.7659
+
+
+
+
+# Old Dropout experiment
 # -                                                                                     CORR = 0.958 RMSE = 1.178 CORR-w = 0.970 RMSE-w = 0.786
 # - tcc:                                                                                CORR = 0.957 RMSE = 1.193 CORR-w = 0.969 RMSE-w = 0.795
 # - tcc,msl:                                                                            CORR = 0.958 RMSE = 1.170 CORR-w = 0.971 RMSE-w = 0.769
@@ -388,31 +567,6 @@ for i,mdl in enumerate(models):
 # - tcc,msl,tp,swvl1,swvl2,u10,swvl3,v10,r,z,sd,mslhf,e,stl2,stl3,t2m:                  CORR = 0.951 RMSE = 1.267 CORR-w = 0.964 RMSE-w = 0.856
 # - tcc,msl,tp,swvl1,swvl2,u10,swvl3,v10,r,z,sd,mslhf,e,stl2,stl3,t2m,msdrswrf:         CORR = 0.947 RMSE = 1.314 CORR-w = 0.963 RMSE-w = 0.865
 # - tcc,msl,tp,swvl1,swvl2,u10,swvl3,v10,r,z,sd,mslhf,e,stl2,stl3,t2m,msdrswrf,stl1:    CORR = 0.906 RMSE = 1.726 CORR-w = 0.943 RMSE-w = 1.051
-
-
-
-# Old Dropout experiment
-# -                                                                                     CORR = 0.951 RMSE = 1.096 CORR-w = 0.970 RMSE-w = 0.387
-# - tcc:                                                                                CORR = 0.951 RMSE = 1.104 CORR-w = 0.969 RMSE-w = 0.390
-# - tcc,msl:                                                                            CORR = 0.951 RMSE = 1.100 CORR-w = 0.970 RMSE-w = 0.384
-# - tcc,msl,swvl2:                                                                      CORR = 0.951 RMSE = 1.101 CORR-w = 0.970 RMSE-w = 0.384
-# - tcc,msl,swvl2,swvl1:                                                                CORR = 0.951 RMSE = 1.101 CORR-w = 0.971 RMSE-w = 0.379
-# - tcc,msl,swvl2,swvl1,tp:                                                             CORR = 0.950 RMSE = 1.110 CORR-w = 0.969 RMSE-w = 0.390
-# - tcc,msl,swvl2,swvl1,tp,sd:                                                          CORR = 0.950 RMSE = 1.115 CORR-w = 0.968 RMSE-w = 0.395
-# - tcc,msl,swvl2,swvl1,tp,sd,swvl3:                                                    CORR = 0.951 RMSE = 1.102 CORR-w = 0.969 RMSE-w = 0.388
-# - tcc,msl,swvl2,swvl1,tp,sd,swvl3,v10:                                                CORR = 0.950 RMSE = 1.105 CORR-w = 0.970 RMSE-w = 0.386
-# - tcc,msl,swvl2,swvl1,tp,sd,swvl3,v10,u10:                                            CORR = 0.951 RMSE = 1.101 CORR-w = 0.972 RMSE-w = 0.372
-# - tcc,msl,swvl2,swvl1,tp,sd,swvl3,v10,u10,z:                                          CORR = 0.950 RMSE = 1.113 CORR-w = 0.970 RMSE-w = 0.385
-# - tcc,msl,swvl2,swvl1,tp,sd,swvl3,v10,u10,z,mslhf:                                    CORR = 0.950 RMSE = 1.115 CORR-w = 0.970 RMSE-w = 0.383
-
-# - tcc,msl,swvl2,swvl1,tp,sd,swvl3,v10,u10,z,mslhf,r:                                  CORR = 0.946 RMSE = 1.149 CORR-w = 0.970 RMSE-w = 0.384
-# - tcc,msl,swvl2,swvl1,tp,sd,swvl3,v10,u10,z,mslhf,r,e:                                CORR = 0.943 RMSE = 1.182 CORR-w = 0.967 RMSE-w = 0.400
-# - tcc,msl,swvl2,swvl1,tp,sd,swvl3,v10,u10,z,mslhf,r,e,stl3:                           CORR = 0.944 RMSE = 1.177 CORR-w = 0.968 RMSE-w = 0.394
-# - tcc,msl,swvl2,swvl1,tp,sd,swvl3,v10,u10,z,mslhf,r,e,stl3,stl2:                      CORR = 0.943 RMSE = 1.187 CORR-w = 0.966 RMSE-w = 0.405
-# - tcc,msl,swvl2,swvl1,tp,sd,swvl3,v10,u10,z,mslhf,r,e,stl3,stl2,t2m:                  CORR = 0.942 RMSE = 1.196 CORR-w = 0.965 RMSE-w = 0.411
-# - tcc,msl,swvl2,swvl1,tp,sd,swvl3,v10,u10,z,mslhf,r,e,stl3,stl2,t2m,msdrswrf:         CORR = 0.936 RMSE = 1.254 CORR-w = 0.962 RMSE-w = 0.427
-# - tcc,msl,swvl2,swvl1,tp,sd,swvl3,v10,u10,z,mslhf,r,e,stl3,stl2,t2m,msdrswrf,stl1:    CORR = 0.899 RMSE = 1.557 CORR-w = 0.943 RMSE-w = 0.521
-
 
 
 

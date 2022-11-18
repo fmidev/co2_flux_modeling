@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-
+import shap
 
 
 import xgboost as xgb
@@ -17,7 +17,7 @@ import xgboost as xgb
 import matplotlib; #matplotlib.use('AGG') #matplotlib.use('qt5agg')
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, RepeatedKFold
 from sklearn.utils import resample
 
 
@@ -57,24 +57,11 @@ import functions as fcts
 all_yrs   = np.arange(1996,2019).astype(int)
 
 
+n_repeats = 8
 
 
 
-'''
 # Target data 
-obs1 = pd.read_csv(data_dir+'smeardata_20210224_set1.csv')
-obs1.index = pd.to_datetime(obs1[['Year','Month','Day','Hour','Minute','Second']])
-obs1.index.name = 'time'
-
-obs1 = obs1.loc['1996-01-01':'2018-12-31']
-
-# Resampling to 6H, skip samples containing NaNs
-obs1 = obs1[['HYY_EDDY233.F_c']].resample('6H').agg(pd.Series.mean, skipna=False)
-
-vrb1 = obs1.columns[0]
-'''
-# Target data 
-#obs = pd.read_csv(data_dir+'smeardata_20210224_set1.csv')
 obs = pd.read_csv(data_dir+'smeardata_20220130_gapfilled.csv')
 gap = pd.read_csv(data_dir+'smeardata_20220130_gapfill_method.csv')
 
@@ -85,8 +72,8 @@ obs.index = pd.to_datetime(obs[['Year','Month','Day','Hour','Minute','Second']])
 obs.index.name = 'time'
 
 obs = obs.loc['1996-01-01':'2018-12-31']
+
 # Resampling to 6H, skip samples containing NaNs
-#obs = obs[['HYY_EDDY233.F_c']].resample('6H').agg(pd.Series.mean, skipna=False)
 obs = obs[['HYY_EDDY233.NEE']].resample('6H').agg(pd.Series.mean, skipna=False)
 
 vrb = obs.columns[0]
@@ -137,20 +124,25 @@ import matplotlib.dates as mdates
 
 
 
+
+
+
 sns.set_theme(style="whitegrid")
 f, ax = plt.subplots(figsize=(12, 3))
 
 clim_6h.plot(lw=0.5, c='k', label='6H mean', ax=ax, alpha=0.8)
 clim_1w.plot(lw=2.5, c='k', label='1W mean', ax=ax, alpha=1)
-ax.axhline(np.nanmean(obs),c='Orange', label='1Y mean')
+ax.axhline(np.nanmean(obs), c='Orange', label='1Y mean')
 ax.axhline(0,c='b', label='Neutral')
 
 
 ax.set_ylabel('µmol m⁻² s⁻¹'); ax.set_xlabel('Time of year')
-ax.set_title('Multi-year means of the measured net ecosystem CO2 exchange')
-ax.legend(loc='lower left'); plt.tight_layout()
+ax.set_title('Multi-year means of the measured net ecosystem CO$_2$ exchange')
+ax.legend(loc='lower left'); 
+#fcts.format_axes(ax)
+plt.tight_layout()
 f.savefig(rslt_dir+'fig_climatology.pdf')
-f.savefig(rslt_dir+'fig01.pdf')
+f.savefig(rslt_dir+'fig01_.pdf')
 f.savefig(rslt_dir+'fig_climatology.png', dpi=200)
 plt.show(); plt.clf(); plt.close('all')
 
@@ -175,11 +167,13 @@ plt.show(); plt.clf(); plt.close('all')
 
 
 # Read ERA5 predictor data
-era5_data = xr.open_dataset(data_dir+'era5_preprocessed.nc').sel(
-    time=slice('1996-01-01', '2018-12-31'), 
-    lat=slice(60,64),
-    lon=slice(22,26)
-    )
+dropout = ['z','swvl2','msl','sd','swvl3','swvl1','tcc','stl2','tp'] 
+dDeg = 0.6; lat_h=61.85; lon_h=24.283
+era5_data = xr.open_dataset(data_dir+'era5_preprocessed_0p25deg.nc').sel(
+    time=slice('1996-01-01', '2020-12-31'), 
+    lat=slice(lat_h - dDeg, lat_h + dDeg), #lat=slice(60,64),
+    lon=slice(lon_h - dDeg, lon_h + dDeg), #lon=slice(22,26)
+    ).drop(dropout)
 
 
 vrbs = list(era5_data.data_vars)
@@ -195,18 +189,16 @@ vrbs.sort()
 X    = fcts.combine_and_define_lags(era5_data, np.arange(-2,3), all_yrs=np.arange(1996,2019))
 X.index = X.index.rename('time'); t_axis = X.index
 
+# Predictor data for a control experiment WITHOUT spatial or temporal lags
+C    = fcts.combine_and_define_lags(era5_data.sel(lat=61.85, lon=24.283, method='nearest'), [0], all_yrs=np.arange(1996,2019))
+C.index = C.index.rename('time')
 
-X.index = X.index.rename('time'); t_axis = X.index
 
 
-# Shuffle X columns
-import random; random.seed(99)
-columns = list(X.columns)
-random.shuffle(columns)
 
-X = X[columns]
 
 print(X)
+print(C)
 
 
 
@@ -217,6 +209,39 @@ print(X)
 
 
 
+
+# Optimization results from runs
+for approach in ['GB', 'RF']:
+    
+    for sfl in ['True','False']:
+        list_of_optim_results = []
+        opt_params_files = glob.glob(data_dir+'best_params_Bayes_optim_*_'+approach+'*'+sfl+'.csv')
+        for file in opt_params_files:
+            data = pd.read_csv(file, usecols=['param','value'], index_col='param')
+            list_of_optim_results.append(data)
+
+        opt_params_mdn  = dict(zip(data.index, np.median(list_of_optim_results, axis=0).squeeze())) 
+        opt_params_std  = dict(zip(data.index, np.std(list_of_optim_results, axis=0).squeeze())) 
+        opt_params_min  = dict(zip(data.index, np.min(list_of_optim_results, axis=0).squeeze())) 
+        opt_params_max  = dict(zip(data.index, np.max(list_of_optim_results, axis=0).squeeze())) 
+
+
+        opt_params_mdn['max_depth'] = int(opt_params_mdn['max_depth'])
+
+        if approach=='GB':
+            opt_params_mdn['n_estimators'] = int(opt_params_mdn['n_estimators'])
+            opt_params_mdn['num_parallel_tree'] = 1
+        if approach=='RF':
+            opt_params_mdn['n_estimators'] = 1
+            opt_params_mdn['num_parallel_tree'] = int(opt_params_mdn['num_parallel_tree'])
+
+
+
+        print('Optimized parameters for '+ approach+' shuffle='+sfl+', mdn:\n',opt_params_mdn)
+        #print('Optimized parameters for '+ approach+' shuffle='+sfl+', std:\n',opt_params_std)
+        print('Optimized parameters for '+ approach+' shuffle='+sfl+', min:\n',opt_params_min)
+        print('Optimized parameters for '+ approach+' shuffle='+sfl+', max:\n',opt_params_max)
+        print('\n')
 
 
 
@@ -229,35 +254,39 @@ print(X)
 
 # Comparison of GB and RF
 result_files = [
-    'obs_mod_co2_gbst_shuffle=True.csv',
-    'obs_mod_co2_gbst_shuffle=False.csv',
-    'obs_mod_co2_rfrs_shuffle=True.csv',
-    'obs_mod_co2_rfrs_shuffle=False.csv',
+    'obs_mod_co2_GB_shuffle=True.csv',
+    'obs_mod_co2_GB_shuffle=False.csv',
+    'obs_mod_co2_RF_shuffle=True.csv',
+    'obs_mod_co2_RF_shuffle=False.csv',
     ]
 
 
 labels = {
-    'gbst_shuffle=True':  'GB, random sampling',
-    'gbst_shuffle=False': 'GB, non-random sampling',
-    'rfrs_shuffle=True':  'RF, random sampling',
-    'rfrs_shuffle=False': 'RF, non-random sampling'
+    'GB_shuffle=True':  'GB, random sampling',
+    'GB_shuffle=False': 'GB, non-random sampling',
+    'RF_shuffle=True':  'RF, random sampling',
+    'RF_shuffle=False': 'RF, non-random sampling'
     }
 
 
 corr_subs = {}
 rmse_subs = {}
+r2ss_subs = {}
+
 
 percentages = np.arange(10,101,10)
 
 
 
 data = obs.copy(deep=True)
-data = data.rename(columns={vrb:    'Observed CO2 flux, 6-hourly'})
+data = data.rename(columns={vrb: 'Observed CO2 flux, 6-hourly'})
 
 not_nans = ~ np.isnan(data['Observed CO2 flux, 6-hourly']).values
 
 data['Observed CO2 flux, weekly']  = fcts.kz_filter(data['Observed CO2 flux, 6-hourly'].loc[not_nans], 28, 1)
 data['Observed CO2 flux, weekly'].loc[~ not_nans] = np.nan
+
+
 
 
 
@@ -268,18 +297,38 @@ for fle in result_files:
     
     # Read modeled results and the model
     Z = pd.read_csv(data_dir+'obs_mod_co2_'+idnt+'.csv', index_col=0)
-    #Z = pd.read_csv(data_dir+'obs_mod_co2_gbst_shuffle=True.csv', index_col=0)
     Z.index = pd.to_datetime(Z.index)
-    #Z['fcs'] = Z['fcs_100'].copy(deep=True)
     
+    Z_reorg = pd.DataFrame()
+    for pr in percentages.astype(str):
+        
+        fcs_cols = []; ctr_cols = []
+        for repeat in np.arange(n_repeats).astype(str):
+            fcs_cols.append('fcs_'+repeat+'_'+pr)
+            ctr_cols.append('ctr_'+repeat+'_'+pr)
+        
+        to_melt = Z[fcs_cols].rename(columns=dict(zip(fcs_cols, range(n_repeats))))
+        melted_fcs = pd.melt(to_melt,var_name='repeat', value_name='fcs_'+pr, ignore_index=False)
+        to_melt = Z[ctr_cols].rename(columns=dict(zip(ctr_cols, range(n_repeats))))
+        melted_ctr = pd.melt(to_melt,var_name='repeat', value_name='ctr_'+pr, ignore_index=False)
+        
+        Z_reorg['repeat']  = melted_fcs['repeat']
+        Z_reorg['time']    = melted_fcs.index
+        Z_reorg['fcs_'+pr] = melted_fcs['fcs_'+pr]
+        Z_reorg['ctr_'+pr] = melted_ctr['ctr_'+pr]
+        
+        Z['fcs_'+pr] = Z_reorg.groupby('time').mean()['fcs_'+pr].copy(deep=True)
+        Z['ctr_'+pr] = Z_reorg.groupby('time').mean()['ctr_'+pr].copy(deep=True)
+    
+    
+    '''
     models = []
-    #mdl_files = np.sort(glob.glob(data_dir+'model_*_for_co2_gbst_shuffle=True.json'))
-    mdl_files = np.sort(glob.glob(data_dir+'model_*_for_co2_'+idnt+'.json'))
+    mdl_files = np.sort(glob.glob(data_dir+'model_*_'+idnt+'*.json'))
     for mdl in mdl_files:
         model = xgb.XGBRegressor()
         model.load_model(mdl)
         models.append(model)
-    
+    '''
     
     
     
@@ -287,7 +336,8 @@ for fle in result_files:
     # Data selection
     #data = Z.copy(deep=True)
     #data = data.rename(columns={'fcs':  labels[idnt]+', 6-hourly'})
-    data[labels[idnt]+', 6-hourly'] = Z['fcs_100'].copy(deep=True)
+    data[labels[idnt]+', 6-hourly'] = Z_reorg.groupby('time').mean()['fcs_100'].copy(deep=True)
+    data[labels[idnt]+', 6-hourly, CTRL'] = Z_reorg.groupby('time').mean()['ctr_100'].copy(deep=True)
     
     #not_nans_6h = ~ np.isnan(data['Observed CO2 flux, 6-hourly']).values
     #not_nans_wk = not_nans_6h # ndimage.binary_erosion(not_nans_6h, structure=np.ones(28)).astype(not_nans_6h.dtype)
@@ -295,25 +345,36 @@ for fle in result_files:
     
     #data['Observed CO2 flux, weekly']  = fcts.kz_filter(data['Observed CO2 flux, 6-hourly'].loc[not_nans_6h], 28, 1)
     data[labels[idnt]+', weekly'] = fcts.kz_filter(data[labels[idnt]+', 6-hourly'].loc[not_nans], 28, 1)
+    data[labels[idnt]+', weekly, CTRL'] = fcts.kz_filter(data[labels[idnt]+', 6-hourly, CTRL'].loc[not_nans], 28, 1)
     
     #data['Observed CO2 flux, weekly'].loc[~ not_nans] = np.nan
     
     
-    corr = []
-    rmse = []
-    for pr in percentages:
-        data['fcs'] = Z['fcs_'+str(pr)]
+    corr = []; corc = []
+    rmse = []; rmsc = []
+    r2ss = []; r2sc = []
+    for pr in percentages.astype(str):
+        
+        data['fcs'] = Z['fcs_'+pr].copy(deep=True)
+        data['ctr'] = Z['ctr_'+pr].copy(deep=True)
         o = data['Observed CO2 flux, 6-hourly'].values
         f = data['fcs'].values
+        c = data['ctr'].values
         
-        cor = fcts.calc_corr(o, f)
-        rms = fcts.calc_rmse(o, f)
         
-        corr.append(cor)
-        rmse.append(rms)
+        corr.append(fcts.calc_corr(o, f))
+        rmse.append(fcts.calc_rmse(o, f))
+        r2ss.append(fcts.calc_r2ss(o, f))
+        corc.append(fcts.calc_corr(o, c))
+        rmsc.append(fcts.calc_rmse(o, c))
+        r2sc.append(fcts.calc_r2ss(o, c))
     
     corr_subs[labels[idnt]] = corr
     rmse_subs[labels[idnt]] = rmse
+    r2ss_subs[labels[idnt]] = r2ss
+    corr_subs[labels[idnt]+', CTRL'] = corc
+    rmse_subs[labels[idnt]+', CTRL'] = rmsc
+    r2ss_subs[labels[idnt]+', CTRL'] = r2sc
 
 
 
@@ -324,33 +385,38 @@ for fle in result_files:
 
 
 
-sns.set_theme(style="white")
-f, [ax1, ax2] = plt.subplots(1,2,figsize=(8,5))
+sns.set_theme(style="whitegrid")
+f, axes = plt.subplots(1,3,figsize=(12,4), sharey=False)
 #ax2 = ax1.twinx()
 
 #plt.suptitle('Dependency of RMSE and CORR\non the amount of fitting data')
-sns.set_palette("PuBuGn_d")
-sns.set_palette("Blues", color_codes=True)
+#sns.set_palette("PuBuGn_d")
+#sns.set_palette("Blues", color_codes=True)
 
 
+sns.lineplot(data=pd.DataFrame(r2ss_subs, index=percentages)[['GB, random sampling', 'GB, non-random sampling', 
+    ]], lw=1.5, palette="Blues_r", alpha=1, ax=axes[0], legend=False)
+sns.lineplot(data=pd.DataFrame(r2ss_subs, index=percentages)[['RF, random sampling', 'RF, non-random sampling', 
+    'RF, random sampling, CTRL']], lw=1.5, palette="Reds_r", alpha=1, ax=axes[0], legend=False)
+sns.lineplot(data=pd.DataFrame(corr_subs, index=percentages)[['GB, random sampling', 'GB, non-random sampling', 
+    ]], lw=1.5, palette="Blues_r", alpha=1, ax=axes[1])
+sns.lineplot(data=pd.DataFrame(corr_subs, index=percentages)[['RF, random sampling', 'RF, non-random sampling', 
+    'RF, random sampling, CTRL']], lw=1.5, palette="Reds_r", alpha=1, ax=axes[1])
+sns.lineplot(data=pd.DataFrame(rmse_subs, index=percentages)[['GB, random sampling', 'GB, non-random sampling', 
+    ]], lw=1.5, palette="Blues_r", alpha=1, ax=axes[2], legend=False)
+sns.lineplot(data=pd.DataFrame(rmse_subs, index=percentages)[['RF, random sampling', 'RF, non-random sampling', 
+    'RF, random sampling, CTRL']], lw=1.5, palette="Reds_r", alpha=1, ax=axes[2], legend=False)
 
-sns.lineplot(data=pd.DataFrame(corr_subs, index=percentages)[['GB, random sampling', 'GB, non-random sampling']], lw=1.5, palette="Blues_r", alpha=1, ax=ax1)
-sns.lineplot(data=pd.DataFrame(corr_subs, index=percentages)[['RF, random sampling', 'RF, non-random sampling']], lw=1.5, palette="Reds_r", alpha=1, ax=ax1)
-sns.lineplot(data=pd.DataFrame(rmse_subs, index=percentages)[['GB, random sampling', 'GB, non-random sampling']], lw=1.5, palette="Blues_r", alpha=1, ax=ax2)
-sns.lineplot(data=pd.DataFrame(rmse_subs, index=percentages)[['RF, random sampling', 'RF, non-random sampling']], lw=1.5, palette="Reds_r", alpha=1, ax=ax2)
-#sns.lineplot(data=pd.DataFrame(rmse_subs, index=percentages), lw=1.5, palette="Reds_r",  alpha=1, ax=ax2)
 
+axes[0].set_title('R2SC'); axes[1].set_title('CORR'); axes[2].set_title('RMSE')
+axes[0].set_xlabel('Amount [%]'); axes[1].set_xlabel('Amount [%]') ; axes[2].set_xlabel('Amount [%]')
+#axes[0].set_ylim([0.78,0.92]); axes[1].set_ylim([0.88,0.96]); axes[2].set_ylim([1.2,2.0])
+axes[1].legend(fontsize='x-small')
 
-ax1.set_title('CORR')
-ax2.set_title('RMSE')
-
-ax1.set_xlabel('Amount [%]')
-ax2.set_xlabel('Amount [%]')
-
-plt.tight_layout(); ax1.legend(); ax2.legend()
-f.savefig(rslt_dir+'fig_corr_rmse_percentages.pdf')
+plt.tight_layout(); 
+f.savefig(rslt_dir+'fig_r2ss_corr_rmse_percentages.pdf')
 f.savefig(rslt_dir+'fig05.pdf')
-f.savefig(rslt_dir+'fig_corr_rmse_percentages.png', dpi=200)
+f.savefig(rslt_dir+'fig_r2ss_rmse_percentages.png', dpi=200)
 plt.show(); plt.clf(); plt.close('all')
 
 
@@ -362,60 +428,101 @@ plt.show(); plt.clf(); plt.close('all')
 
 
 
+# SHAP value analysis
+# Warning! This analysis is slow to compute
 for fle in result_files:
     
     idnt = fle[12:-4]
     print(idnt)
     
-    # Read modeled results and the model
+    # Read modeled results 
     Z = pd.read_csv(data_dir+'obs_mod_co2_'+idnt+'.csv', index_col=0)
     Z.index = pd.to_datetime(Z.index)
-    Z['fcs'] = Z['fcs_100'].copy(deep=True)
     
+    Z_reorg = pd.DataFrame()
+    for pr in percentages.astype(str):
+        
+        fcs_cols = []; ctr_cols = []
+        for repeat in np.arange(n_repeats).astype(str):
+            fcs_cols.append('fcs_'+repeat+'_'+pr)
+            ctr_cols.append('ctr_'+repeat+'_'+pr)
+        
+        to_melt = Z[fcs_cols].rename(columns=dict(zip(fcs_cols, range(n_repeats))))
+        melted_fcs = pd.melt(to_melt,var_name='repeat', value_name='fcs_'+pr, ignore_index=False)
+        to_melt = Z[ctr_cols].rename(columns=dict(zip(ctr_cols, range(n_repeats))))
+        melted_ctr = pd.melt(to_melt,var_name='repeat', value_name='ctr_'+pr, ignore_index=False)
+        
+        Z_reorg['repeat']  = melted_fcs['repeat']
+        Z_reorg['time']    = melted_fcs.index
+        Z_reorg['fcs_'+pr] = melted_fcs['fcs_'+pr]
+        Z_reorg['ctr_'+pr] = melted_ctr['ctr_'+pr]
+        
+        Z['fcs_'+pr] = Z_reorg.groupby('time').mean()['fcs_'+pr].copy(deep=True)
+        Z['ctr_'+pr] = Z_reorg.groupby('time').mean()['ctr_'+pr].copy(deep=True)
+    
+    
+    # Read the models
     models = []
-    mdl_files = np.sort(glob.glob(data_dir+'model_*_for_co2_'+idnt+'.json'))
+    mdl_files = np.sort(glob.glob(data_dir+'model_*_*_'+idnt+'.json'))
     for mdl in mdl_files:
         xgb_model = xgb.XGBRegressor()
         xgb_model.load_model(mdl)
         models.append(xgb_model)
     
-    
-    
-    # Predictor importance
+        
+    '''
+    # SHAP Predictor importance
     sns.set_theme(style="whitegrid")
-    f, ax = plt.subplots(1,len(models),figsize=(14, 8))
-    for i,mdl in enumerate(models):
-        out = mdl.predict(X.loc[X.index[0:2]].values)
-        mdl.get_booster().feature_names = list(X.columns)
-        print(len(mdl.get_booster().feature_names), len(X.columns))
+    f, ax = plt.subplots(1,len(models),figsize=(45, 8))
+    #kf = KFold(5, shuffle=True, random_state=99);
+    kf = RepeatedKFold(n_splits=5, n_repeats=n_repeats, random_state=99) 
+    fold = 0
+    split_count=0
+    i = 0
+    #for i,mdl in enumerate(models):
+    for trn_idx, tst_idx in kf.split(all_yrs):
+        mdl = models[i]
+        fold = np.mod(split_count,5) + 1
+        rept = np.floor_divide(split_count,5) 
+        
         sns.set_theme(style="ticks")
         
-        xgb.plot_importance(mdl, importance_type='gain', title='Gain,\nmodel '+str(i+1), ylabel='',
-            max_num_features=40, show_values=False, height=0.7, ax=ax[i])
+        sorted_names, sorted_SHAP = fcts.extract_shap_values(X.iloc[tst_idx], models[i])
+        
+        ax[i].barh(sorted_names[0:40], sorted_SHAP[0:40])#, ax=ax[i])
         #ax[i].set_xscale('log')
         ax[i].set_xlabel('')
-    
+        i += 1
+        split_count += 1
     
     plt.tight_layout()
-    f.savefig(rslt_dir+'fig_feat_importance_PREDICTORS_gain_'+idnt+'.pdf')
-    f.savefig(rslt_dir+'fig_feat_importance_PREDICTORS_gain_'+idnt+'.png', dpi=200)
-    if idnt=='gbst_shuffle=True':
+    f.savefig(rslt_dir+'fig_feat_importance_PREDICTORS_shap_'+idnt+'.pdf')
+    f.savefig(rslt_dir+'fig_feat_importance_PREDICTORS_shap_'+idnt+'.png', dpi=200)
+    if s:
         f.savefig(rslt_dir+'fig06.pdf')
-    #plt.show()
     
-    
+    ''' 
+        
     
     
     
     # Group the data embedded in the individual predictors for supplementary figs
-    all_scores = pd.DataFrame(columns=['Model', 'Predictor variable', 'Lag', 'Grid cell', 'Mean gain'])
+    all_scores = pd.DataFrame(columns=['Model', 'Predictor variable', 'Lag', 'Grid cell', 'Mean SHAP'])
+    
+    #for i,mdl in enumerate(models):
+    #kf = KFold(5, shuffle=True, random_state=99);
+    kf = RepeatedKFold(n_splits=5, n_repeats=n_repeats, random_state=99) 
     row=0
-    for i,mdl in enumerate(models):
-        bst = mdl.get_booster()
-        gains = np.array(list(bst.get_score(importance_type='gain').values()))
-        features = np.array(list(bst.get_fscore().keys())) #np.array(X.columns)[sorted_idx]
-        for ft, gn in zip(features, gains):
-            print(i+1,ft,gn)
+    fold = 0
+    split_count=0
+    i = 0
+    for trn_idx, tst_idx in kf.split(all_yrs):
+        
+        sorted_names, sorted_SHAP = fcts.extract_shap_values(X.iloc[tst_idx], models[i])
+        
+        #for ft, gn in zip(features, gains):
+        for ft, sh in zip(sorted_names, sorted_SHAP):
+            print(i+1,ft,sh)
             try:
                 _, prd, gc_lg = ft.split('_')
                 lag = int(gc_lg[-2:])
@@ -425,81 +532,91 @@ for fle in result_files:
                 lag = 0
                 gcl = 4
             
-            all_scores.loc[row] = (i+1, prd, lag, gcl, gn); row += 1 
+            all_scores.loc[row] = (i+1, prd, lag, gcl, sh); row += 1 
+        
+        i += 1
+        split_count += 1
     
     
     
-    
-    mean_scores = all_scores.groupby('Predictor variable').mean().sort_values('Mean gain')
     
     sns.set_theme(style="whitegrid")
-    f, ax = plt.subplots(1,1,figsize=(8, 8))
-    mean_scores.plot.barh(ax=ax, legend=False)
-    ax.set_xlabel('F score')
-    ax.set_title('Mean gain over models, grid cells and lags')
-    ax.set_xscale('log')
-    plt.tight_layout()
-    f.savefig(rslt_dir+'fig_feat_importance_MEAN_gain_'+idnt+'.pdf')
-    f.savefig(rslt_dir+'fig_feat_importance_MEAN_gain_'+idnt+'.png', dpi=200)
-    if idnt=='gbst_shuffle=True':
-        f.savefig(rslt_dir+'figA01.pdf')
+    f, ax = plt.subplots(1,3,figsize=(12, 8))
+    
+    mean_scores = all_scores.groupby('Predictor variable').mean()['Mean SHAP'].sort_values()
+    mean_scores.plot.barh(ax=ax[0], width=0.3, legend=False)
+    ax[0].xaxis.set_major_locator(plt.MaxNLocator(5))
+    #ax[0].set_xlabel('SHAP value')
+    ax[0].set_title('mean(|SHAP|) over\nmodels, grid cells and lags')
+    
+    mean_scores = all_scores.groupby('Grid cell').mean()['Mean SHAP'].sort_values()
+    mean_scores.plot.barh(ax=ax[1], width=0.75, legend=False)
+    ax[1].xaxis.set_major_locator(plt.MaxNLocator(5))
+    #ax[1].set_xlabel('SHAP value')
+    ax[1].set_title('mean(|SHAP|) over\nmodels, variables and lags')
+    
+    mean_scores = all_scores.groupby('Lag').mean()['Mean SHAP'].sort_values()
+    mean_scores.plot.barh(ax=ax[2], width=0.15, legend=False)
+    ax[2].xaxis.set_major_locator(plt.MaxNLocator(5))
+    #ax[2].set_xlabel('SHAP value')
+    ax[2].set_title('mean(|SHAP|) over\nmodels, variables, and grid cells')
+    
+    plt.figtext(0.06,0.96,'(a)',fontsize=25,fontstyle='italic',fontweight='bold')
+    plt.figtext(0.37,0.96,'(b)',fontsize=25,fontstyle='italic',fontweight='bold')
+    plt.figtext(0.69,0.96,'(c)',fontsize=25,fontstyle='italic',fontweight='bold')
+    
+    plt.tight_layout(); 
+    f.savefig(rslt_dir+'fig_feat_importance_all_SHAP_'+idnt+'.pdf')
+    f.savefig(rslt_dir+'fig_feat_importance_all_SHAP_'+idnt+'.png', dpi=200)
+    if idnt=='GB_shuffle=True':
+        f.savefig(rslt_dir+'fig06.pdf')
     
     #plt.show()
     plt.clf(); plt.close('all')
     
     
     
-    mean_scores = all_scores.groupby('Grid cell').mean().sort_values('Mean gain')
-    
-    sns.set_theme(style="whitegrid")
-    f, ax = plt.subplots(1,1,figsize=(8, 8))
-    mean_scores.plot.barh(ax=ax, legend=False)
-    ax.set_xlabel('F score')
-    ax.set_title('Mean gain over models, variables and lags')
-    plt.tight_layout()
-    f.savefig(rslt_dir+'fig_feat_importance_GRIDCELL_gain_'+idnt+'.pdf')
-    f.savefig(rslt_dir+'fig_feat_importance_GRIDCELL_gain_'+idnt+'.png', dpi=200)
-    if idnt=='gbst_shuffle=True':
-        f.savefig(rslt_dir+'figA02.pdf')
-    
-    #plt.show()
-    plt.clf(); plt.close('all')
-    
-    
-    mean_scores = all_scores.groupby('Lag').mean().sort_values('Mean gain')
-    
-    sns.set_theme(style="whitegrid")
-    f, ax = plt.subplots(1,1,figsize=(8, 8))
-    mean_scores.plot.barh(ax=ax, legend=False)
-    ax.set_xlabel('F score')
-    ax.set_title('Mean gain over models, variables, and grid cells')
-    plt.tight_layout()
-    f.savefig(rslt_dir+'fig_feat_importance_LAG_gain_'+idnt+'.pdf')
-    f.savefig(rslt_dir+'fig_feat_importance_LAG_gain_'+idnt+'.png', dpi=200)
-    if idnt=='gbst_shuffle=True':
-        f.savefig(rslt_dir+'figA03.pdf')
-    
-    #plt.show()
-    plt.clf(); plt.close('all')
-    
-    
-    
-    mean_scores = all_scores.groupby(['Grid cell', 'Lag']).mean().sort_values('Mean gain')
+    mean_scores = all_scores.groupby(['Grid cell', 'Lag']).mean()['Mean SHAP'].sort_values()
     
     sns.set_theme(style="whitegrid")
     f, ax = plt.subplots(1,1,figsize=(4, 12))
     mean_scores.plot.barh(ax=ax, legend=False)
-    ax.set_xlabel('F score')
+    ax.set_xlabel('SHAP value')
     
-    ax.set_title('Mean gain over models and variables, \ngrouped by (grid cells, lags)')
-    plt.tight_layout()
-    ax.set_xscale('log')
+    ax.set_title('mean(|SHAP|) over models and variables, \ngrouped by (grid cells, lags)')
+    plt.tight_layout(); plt.locator_params(axis='x', nbins=4)
+    #ax.set_xscale('log')
     ax.tick_params(axis='both', which='major', labelsize=6)
-    f.savefig(rslt_dir+'fig_feat_importance_LAGetGRIDCELL_gain_'+idnt+'.pdf')
-    f.savefig(rslt_dir+'fig_feat_importance_LAGetGRIDCELL_gain_'+idnt+'.png', dpi=200)
-    if idnt=='gbst_shuffle=True':
+    f.savefig(rslt_dir+'fig_feat_importance_LAGetGRIDCELL_SHAP_'+idnt+'.pdf')
+    f.savefig(rslt_dir+'fig_feat_importance_LAGetGRIDCELL_SHAP_'+idnt+'.png', dpi=200)
+    if idnt=='GB_shuffle=True':
         f.savefig(rslt_dir+'figA04.pdf')
     
+    #plt.show()
+    plt.clf(); plt.close('all')
+    
+    
+    
+    mean_scores = all_scores.groupby(['Grid cell']).mean()['Mean SHAP'].sort_values()
+    gcells = xr.full_like(era5_data['t2m'][0].drop('time').stack(gridcell=('lat','lon')), np.nan).rename('grid_cells')
+    gcells.attrs = {'units': 'Number'}
+    gcells = gcells.to_dataset()
+    gcells['SHAP'] = xr.full_like(gcells['gridcell'], np.nan).astype(float)
+    gcells['Number'] = xr.full_like(gcells['gridcell'], np.nan)
+    for i,gc in enumerate(gcells.gridcell.values): 
+        print(i+1,gc)
+        gcells['SHAP'].loc[{'gridcell':gc}] = float(mean_scores.loc[i+1])
+        gcells['Number'].loc[{'gridcell':gc}] = i+1
+    
+    f, ax = plt.subplots(1,1,figsize=(8, 8))
+    lats,lons = gcells.unstack('gridcell').lat.values, gcells.unstack('gridcell').lon.values
+    data_shap = pd.DataFrame(gcells['SHAP'].unstack('gridcell'), index=lats, columns=lons).sort_index(ascending=False)
+    data_nmbr = pd.DataFrame(gcells['Number'].unstack('gridcell'), index=lats, columns=lons).sort_index(ascending=False)
+    h = sns.heatmap(data_shap, annot=data_nmbr, cmap="YlGnBu_r",linewidths=.3,zorder=0,ax=ax); # plt.show()
+    #s = sns.scatterplot(y=[61.85],x=[24.283],s=200,color='r',zorder=99,ax=ax) 
+    ax.scatter(y=[61.85],x=[24.283],s=200,color='r',zorder=99) 
+    plt.tight_layout()
+    f.savefig(rslt_dir+'fig_feat_importance_GRIDCELL_spatial_SHAP_'+idnt+'.pdf')
     #plt.show()
     plt.clf(); plt.close('all')
 
@@ -633,61 +750,140 @@ plt.clf(); plt.close('all')
 
 
 
-# Diurnal and monthly decomposition and analysis of CORR and RMSE skill
-mndi_corr_grb = pd.DataFrame(index=np.arange(1,13), columns=(0, 6, 12, 18))
-mndi_rmse_grb = pd.DataFrame(index=np.arange(1,13), columns=(0, 6, 12, 18))
-mndi_corr_rfr = pd.DataFrame(index=np.arange(1,13), columns=(0, 6, 12, 18))
-mndi_rmse_rfr = pd.DataFrame(index=np.arange(1,13), columns=(0, 6, 12, 18))
-for hr in (0, 6, 12, 18):
+
+
+
+
+
+
+
+
+
+
+# Diurnal and monthly decomposition and analysis of R2SC, CORR, and RMSE skill
+mndi_corr = {}
+mndi_rmse = {}
+mndi_r2ss = {}
+
+
+for fle in result_files:
+    
+    idnt = fle[12:-4]
+    print(idnt)
+    
+    # Read modeled results 
+    Z = pd.read_csv(data_dir+'obs_mod_co2_'+idnt+'.csv', index_col=0)
+    Z.index = pd.to_datetime(Z.index)
+    
+    not_nans_Z = ~ np.isnan(Z['HYY_EDDY233.NEE']).values
+    corr_out = pd.DataFrame(index=np.arange(1,13), columns=(0, 6, 12, 18))
+    rmse_out = pd.DataFrame(index=np.arange(1,13), columns=(0, 6, 12, 18))
+    r2ss_out = pd.DataFrame(index=np.arange(1,13), columns=(0, 6, 12, 18))
+    
     for mn in np.arange(1,13):
-        idx = (data.index.hour == hr) & (data.index.month == mn)
-        obs = data['Observed CO2 flux, 6-hourly'  ][idx & not_nans]
-        grb = data['GB, random sampling, 6-hourly'][idx & not_nans]
-        rfr = data['RF, random sampling, 6-hourly'][idx & not_nans]
-        cor_grb, _ = fcts.calc_bootstrap(grb.values,obs.values,fcts.calc_corr, [0.5, 2.5, 50, 97.5, 99.5], 1000)
-        rms_grb, _ = fcts.calc_bootstrap(grb.values,obs.values,fcts.calc_rmse, [0.5, 2.5, 50, 97.5, 99.5], 1000)
-        cor_rfr, _ = fcts.calc_bootstrap(rfr.values,obs.values,fcts.calc_corr, [0.5, 2.5, 50, 97.5, 99.5], 1000)
-        rms_rfr, _ = fcts.calc_bootstrap(rfr.values,obs.values,fcts.calc_rmse, [0.5, 2.5, 50, 97.5, 99.5], 1000)
-        print(mn, hr, cor_grb, cor_rfr, rms_grb, rms_rfr)
-        mndi_corr_grb.loc[mn,hr] = cor_grb[2]
-        mndi_rmse_grb.loc[mn,hr] = rms_grb[2]
-        mndi_corr_rfr.loc[mn,hr] = cor_rfr[2]
-        mndi_rmse_rfr.loc[mn,hr] = rms_rfr[2]
+        for hr in (0, 6, 12, 18):
+            idx = (Z.index.hour == hr) & (Z.index.month == mn)
+            
+            
+            obs = Z['HYY_EDDY233.NEE'][idx & not_nans_Z]
+            cor = []; r2s = []; rms = []
+            for repeat in np.arange(n_repeats).astype(str):
+                cor.append(fcts.calc_corr(obs, Z['fcs_'+repeat+'_100'][idx & not_nans_Z]))
+                r2s.append(fcts.calc_r2ss(obs, Z['fcs_'+repeat+'_100'][idx & not_nans_Z]))
+                rms.append(fcts.calc_rmse(obs, Z['fcs_'+repeat+'_100'][idx & not_nans_Z]))
+            
+            cor = np.percentile(cor, [0.5, 2.5, 50, 97.5, 99.5])
+            r2s = np.percentile(r2s, [0.5, 2.5, 50, 97.5, 99.5])
+            rms = np.percentile(rms, [0.5, 2.5, 50, 97.5, 99.5])
+            
+            print(mn, hr, r2s, rms, cor)
+            
+            corr_out.loc[mn,hr] = cor[2]
+            rmse_out.loc[mn,hr] = rms[2]
+            r2ss_out.loc[mn,hr] = r2s[2]
+            
+    
+    mndi_corr[idnt] = corr_out.astype(float)
+    mndi_rmse[idnt] = rmse_out.astype(float)
+    mndi_r2ss[idnt] = r2ss_out.astype(float)
+    
+    
 
 
-mndi_corr_grb = mndi_corr_grb.astype(float)
-mndi_rmse_grb = mndi_rmse_grb.astype(float)
-mndi_corr_rfr = mndi_corr_rfr.astype(float)
-mndi_rmse_rfr = mndi_rmse_rfr.astype(float)
 
 
 
 
 
-# Evolution of CORR and RMSE skill over time
-boot_rms_grb = []
-boot_cor_grb = []
-boot_rms_rfr = []
-boot_cor_rfr = []
-cmpt = []
 
-#to_plot = data[['Observed CO2 flux, 6-hourly','Observed CO2 flux, weekly']]
-for yr in all_yrs:
-    yr_idx = data.index.year == yr
-    completeness = (yr_idx & not_nans).sum() / (365.24*4) * 100
-    obs = data['Observed CO2 flux, 6-hourly'  ][yr_idx & not_nans]
-    grb = data['GB, random sampling, 6-hourly'][yr_idx & not_nans]
-    rfr = data['RF, random sampling, 6-hourly'][yr_idx & not_nans]
-    _, bts_rms_grb = fcts.calc_bootstrap(grb.values,obs.values,fcts.calc_rmse, [0.5, 2.5, 50, 97.5, 99.5], 1000)
-    _, bts_cor_grb = fcts.calc_bootstrap(grb.values,obs.values,fcts.calc_corr, [0.5, 2.5, 50, 97.5, 99.5], 1000)
-    _, bts_rms_rfr = fcts.calc_bootstrap(rfr.values,obs.values,fcts.calc_rmse, [0.5, 2.5, 50, 97.5, 99.5], 1000)
-    _, bts_cor_rfr = fcts.calc_bootstrap(rfr.values,obs.values,fcts.calc_corr, [0.5, 2.5, 50, 97.5, 99.5], 1000)
-    boot_rms_grb.append(bts_rms_grb)
-    boot_cor_grb.append(bts_cor_grb)
-    boot_rms_rfr.append(bts_rms_rfr)
-    boot_cor_rfr.append(bts_cor_rfr)
-    cmpt.append(completeness.round(1))
-    print(yr, completeness.round(1))
+
+# Evolution of CORR, R2 and RMSE skill over time
+yrly_corr = {}
+yrly_rmse = {}
+yrly_r2ss = {}
+cmpt = {}
+
+
+for fle in result_files:
+    
+    idnt = fle[12:-4]
+    print(idnt)
+    
+    # Read modeled results and the model
+    Z = pd.read_csv(data_dir+'obs_mod_co2_'+idnt+'.csv', index_col=0)
+    Z.index = pd.to_datetime(Z.index)
+    
+    yrly_corr[idnt] = []
+    yrly_rmse[idnt] = []
+    yrly_r2ss[idnt] = []
+    cmpt[idnt] = []
+    
+    for yr in all_yrs:
+        
+        not_nans_Z = ~ np.isnan(Z['HYY_EDDY233.NEE']).values
+        #yr_idx = data.index.year == yr
+        yr_idx = Z.index.year == yr
+        
+        completeness = (yr_idx & not_nans_Z).sum() / (365.24*4) * 100
+        
+        
+        obs = Z['HYY_EDDY233.NEE'][yr_idx & not_nans_Z]
+        cor = []; r2s = []; rms = []
+        for repeat in np.arange(n_repeats).astype(str):
+            cor.append(fcts.calc_corr(obs, Z['fcs_'+repeat+'_100'][yr_idx & not_nans_Z]))
+            r2s.append(fcts.calc_r2ss(obs, Z['fcs_'+repeat+'_100'][yr_idx & not_nans_Z]))
+            rms.append(fcts.calc_rmse(obs, Z['fcs_'+repeat+'_100'][yr_idx & not_nans_Z]))
+        
+        
+        '''
+        obs = data['Observed CO2 flux, 6-hourly'  ][yr_idx & not_nans]
+        grb = data['GB, random sampling, 6-hourly'][yr_idx & not_nans]
+        rfr = data['RF, random sampling, 6-hourly'][yr_idx & not_nans]
+        _, bts_rms_grb = fcts.calc_bootstrap(grb.values,obs.values,fcts.calc_rmse, [0.5, 2.5, 50, 97.5, 99.5], 1000)
+        _, bts_cor_grb = fcts.calc_bootstrap(grb.values,obs.values,fcts.calc_corr, [0.5, 2.5, 50, 97.5, 99.5], 1000)
+        _, bts_r2s_grb = fcts.calc_bootstrap(grb.values,obs.values,fcts.calc_r2ss, [0.5, 2.5, 50, 97.5, 99.5], 1000)
+        _, bts_rms_rfr = fcts.calc_bootstrap(rfr.values,obs.values,fcts.calc_rmse, [0.5, 2.5, 50, 97.5, 99.5], 1000)
+        _, bts_cor_rfr = fcts.calc_bootstrap(rfr.values,obs.values,fcts.calc_corr, [0.5, 2.5, 50, 97.5, 99.5], 1000)
+        _, bts_r2s_rfr = fcts.calc_bootstrap(rfr.values,obs.values,fcts.calc_r2ss, [0.5, 2.5, 50, 97.5, 99.5], 1000)
+        boot_rms_grb.append(bts_rms_grb)
+        boot_cor_grb.append(bts_cor_grb)
+        boot_r2s_grb.append(bts_r2s_grb)
+        boot_rms_rfr.append(bts_rms_rfr)
+        boot_cor_rfr.append(bts_cor_rfr)
+        boot_r2s_rfr.append(bts_r2s_rfr)
+        '''
+        
+        yrly_corr[idnt].append(cor) 
+        yrly_rmse[idnt].append(rms)
+        yrly_r2ss[idnt].append(r2s)
+        
+        cmpt[idnt].append(completeness.round(1))
+        print(yr, completeness.round(1), 'R2SS median:', np.median(r2s))
+
+
+
+
+
 
 
 
@@ -696,77 +892,95 @@ for yr in all_yrs:
 from matplotlib.gridspec import GridSpec
 import matplotlib as mpl
 
-fig=plt.figure(figsize=(16,8))
+fig=plt.figure(figsize=(16,12))
 
-gs=GridSpec(2,3) # 2 rows, 3 columns
+gs=GridSpec(3,3) # 3 rows, 3 columns
 
+#ax1=fig.add_subplot(gs[0,0]) # First row, first column
+#ax2=fig.add_subplot(gs[1,0]) # Second row, first column
+#ax3=fig.add_subplot(gs[0,1:]) # First row, second column
+#ax4=fig.add_subplot(gs[1,1:]) # Second row, second column
 ax1=fig.add_subplot(gs[0,0]) # First row, first column
 ax2=fig.add_subplot(gs[1,0]) # Second row, first column
-ax3=fig.add_subplot(gs[0,1:]) # First row, second column
-ax4=fig.add_subplot(gs[1,1:]) # First row, third column
+ax3=fig.add_subplot(gs[2,0]) # Third row, first column
+ax4=fig.add_subplot(gs[0,1:]) # First row, second column
+ax5=fig.add_subplot(gs[1,1:]) # Second row, second column
+ax6=fig.add_subplot(gs[2,1:]) # Third row, second column
 
 
 sns.set_theme(style="white")
-sns.heatmap(mndi_rmse_grb, cmap='hot_r', annot=True, ax=ax1)
-sns.heatmap(mndi_corr_grb, cmap='YlGnBu_r', annot=True, ax=ax2)
-ax1.set_title('RMSE'); ax1.set_xlabel('Hour');  ax1.set_ylabel('Month'); 
-ax2.set_title('CORR'); ax2.set_xlabel('Hour');  ax2.set_ylabel('Month'); 
-
+sns.heatmap(mndi_rmse['GB_shuffle=True'], cmap='Blues', annot=True, ax=ax1)
+sns.heatmap(mndi_corr['GB_shuffle=True'], cmap='Reds_r', annot=True, ax=ax2)
+sns.heatmap(mndi_r2ss['GB_shuffle=True'], cmap='Greens_r', annot=True, ax=ax3)
+ax1.set_title('RMSE, GB'); ax1.set_xlabel('Hour');  ax1.set_ylabel('Month'); 
+ax2.set_title('CORR, GB'); ax2.set_xlabel('Hour');  ax2.set_ylabel('Month'); 
+ax3.set_title('R2SC, GB'); ax3.set_xlabel('Hour');  ax3.set_ylabel('Month'); 
 
 sns.set_theme(style="whitegrid")
 
 
-sel = np.array(cmpt) > 30 
+sel = np.array(cmpt['GB_shuffle=True']) > 30 
 nan = ~sel
 
 
-to_plot1 = pd.DataFrame(np.array(boot_rms_rfr).T, columns=all_yrs); to_plot1[to_plot1.columns[nan]] = np.nan
-to_plot1 = pd.melt(to_plot1, var_name='Year', value_name='RMSE')
-to_plot1['Model'] = 'RF'
-to_plot2 = pd.DataFrame(np.array(boot_rms_grb).T, columns=all_yrs); to_plot2[to_plot2.columns[nan]] = np.nan
-to_plot2 = pd.melt(to_plot2, var_name='Year', value_name='RMSE')
-to_plot2['Model'] = 'GB'
+to_plot1 = pd.DataFrame(np.array(yrly_rmse['RF_shuffle=True']).T, columns=all_yrs); to_plot1[to_plot1.columns[nan]] = np.nan
+to_plot1 = pd.melt(to_plot1, var_name='Year', value_name='RMSE'); to_plot1['Model'] = 'RF'
+to_plot2 = pd.DataFrame(np.array(yrly_rmse['GB_shuffle=True']).T, columns=all_yrs); to_plot2[to_plot2.columns[nan]] = np.nan
+to_plot2 = pd.melt(to_plot2, var_name='Year', value_name='RMSE'); to_plot2['Model'] = 'GB'
 to_plot = pd.concat([to_plot1, to_plot2], ignore_index=True, sort=False)
 
-g = sns.boxenplot(data=to_plot, x='Year', y='RMSE', hue='Model', ax=ax3, width=0.7, color='b', k_depth=10, showfliers=False, linewidth=1 ) 
-
-
+f = sns.boxplot(data=to_plot, x='Year', y='RMSE', hue='Model', ax=ax4, width=0.7, color='b', showfliers=False, whis=100, linewidth=1 ) 
 print(to_plot.groupby('Year').median())
 
-
-#ax3.set_title('RMSE'); 
-ax3.legend(loc='upper left'); ax3.set_xlabel('')
-ax3.set_xticks(ax3.get_xticks()+.5, minor=True)
-ax3.yaxis.grid(False); ax3.xaxis.grid(True, which='minor') 
-
-labels = g.get_xticklabels(); g.set_xticklabels(labels, rotation=30)
-
-to_plot1 = pd.DataFrame(np.array(boot_cor_rfr).T, columns=all_yrs); to_plot1[to_plot1.columns[nan]] = np.nan
-to_plot1 = pd.melt(to_plot1, var_name='Year', value_name='CORR')
-to_plot1['Model'] = 'RF'
-to_plot2 = pd.DataFrame(np.array(boot_cor_grb).T, columns=all_yrs); to_plot2[to_plot2.columns[nan]] = np.nan
-to_plot2 = pd.melt(to_plot2, var_name='Year', value_name='CORR')
-to_plot2['Model'] = 'GB'
-to_plot = pd.concat([to_plot1, to_plot2], ignore_index=True, sort=False)
-
-h = sns.boxenplot(data=to_plot, x='Year', y='CORR', hue='Model', ax=ax4, width=0.7, color='r', k_depth=10, showfliers=False, linewidth=1 ) 
-
-print(to_plot.groupby('Year').median())
-
-
-
-
-
-#ax4.set_title('CORR'); 
 ax4.legend(loc='upper left'); ax4.set_xlabel('')
 ax4.set_xticks(ax4.get_xticks()+.5, minor=True)
 ax4.yaxis.grid(False); ax4.xaxis.grid(True, which='minor') 
 
+
+
+to_plot1 = pd.DataFrame(np.array(yrly_corr['RF_shuffle=True']).T, columns=all_yrs); to_plot1[to_plot1.columns[nan]] = np.nan
+to_plot1 = pd.melt(to_plot1, var_name='Year', value_name='CORR'); to_plot1['Model'] = 'RF'
+to_plot2 = pd.DataFrame(np.array(yrly_corr['GB_shuffle=True']).T, columns=all_yrs); to_plot2[to_plot2.columns[nan]] = np.nan
+to_plot2 = pd.melt(to_plot2, var_name='Year', value_name='CORR'); to_plot2['Model'] = 'GB'
+to_plot = pd.concat([to_plot1, to_plot2], ignore_index=True, sort=False)
+
+g = sns.boxplot(data=to_plot, x='Year', y='CORR', hue='Model', ax=ax5, width=0.7, color='r', showfliers=False, whis=100, linewidth=1 ) 
+print(to_plot.groupby('Year').median())
+
+ax5.legend(loc='upper left'); ax5.set_xlabel('')
+ax5.set_xticks(ax5.get_xticks()+.5, minor=True)
+ax5.yaxis.grid(False); ax5.xaxis.grid(True, which='minor') 
+
+
+to_plot1 = pd.DataFrame(np.array(yrly_r2ss['RF_shuffle=True']).T, columns=all_yrs); to_plot1[to_plot1.columns[nan]] = np.nan
+to_plot1 = pd.melt(to_plot1, var_name='Year', value_name='R2SC'); to_plot1['Model'] = 'RF'
+to_plot2 = pd.DataFrame(np.array(yrly_r2ss['GB_shuffle=True']).T, columns=all_yrs); to_plot2[to_plot2.columns[nan]] = np.nan
+to_plot2 = pd.melt(to_plot2, var_name='Year', value_name='R2SC'); to_plot2['Model'] = 'GB'
+to_plot = pd.concat([to_plot1, to_plot2], ignore_index=True, sort=False)
+
+h = sns.boxplot(data=to_plot, x='Year', y='R2SC', hue='Model', ax=ax6, width=0.7, color='g', showfliers=False, whis=100, linewidth=1 ) 
+print(to_plot.groupby('Year').median())
+
+ax6.legend(loc='upper left'); ax6.set_xlabel('')
+ax6.set_xticks(ax6.get_xticks()+.5, minor=True)
+ax6.yaxis.grid(False); ax6.xaxis.grid(True, which='minor') 
+
+
+#labels = h.get_xticklabels(); h.set_xticklabels(labels, rotation=30)
+
+
+#ax4.set_title('CORR'); 
+ax6.legend(loc='upper left'); ax6.set_xlabel('')
+ax6.set_xticks(ax6.get_xticks()+.5, minor=True)
+ax6.yaxis.grid(False); ax6.xaxis.grid(True, which='minor') 
+
+labels = f.get_xticklabels(); f.set_xticklabels(labels, rotation=30)
+labels = g.get_xticklabels(); g.set_xticklabels(labels, rotation=30)
 labels = h.get_xticklabels(); h.set_xticklabels(labels, rotation=30)
 
 
-plt.figtext(0.02,0.94,'a)',fontsize=25,fontstyle='italic',fontweight='bold')
-plt.figtext(0.34,0.94,'b)',fontsize=25,fontstyle='italic',fontweight='bold')
+plt.figtext(0.02,0.94,'(a)',fontsize=25,fontstyle='italic',fontweight='bold')
+plt.figtext(0.34,0.94,'(b)',fontsize=25,fontstyle='italic',fontweight='bold')
 
 
 #plt.suptitle('Bootstrap estimates of RMSE and Pearson correlation with 10$^4$ samples, estimated from 6-hourly data')
@@ -791,8 +1005,7 @@ plt.clf(); plt.close('all')
 # Scatter plots / density histograms
 import matplotlib.cm as cm
 from matplotlib.colors import LogNorm, SymLogNorm
-sns.set_theme(style="ticks")
-f, axes = plt.subplots(2,2, figsize=(10,10))#, sharex=True, sharey=True)
+
 
 
 
@@ -803,16 +1016,23 @@ to_plot = [ data.iloc[not_nans][['Observed CO2 flux, 6-hourly', 'GB, random samp
             data.iloc[not_nans][['Observed CO2 flux, weekly',   'RF, random sampling, weekly']] ]
 
 
+
+sns.set_theme(style="ticks")
+f, axes = plt.subplots(2,2, figsize=(10,10))#, sharex=True, sharey=True)
 for ax, pl in zip(axes.ravel(), to_plot):
     
     corr = fcts.calc_corr(pl[pl.columns[0]], pl[pl.columns[1]]).round(3)
     rmse = fcts.calc_rmse(pl[pl.columns[0]], pl[pl.columns[1]]).round(3)
+    r2ss = fcts.calc_r2ss(pl[pl.columns[0]], pl[pl.columns[1]]).round(3)
     
     # Bootstrap estimates
-    rms_b, _ = fcts.calc_bootstrap(pl[pl.columns[1]].values,pl[pl.columns[0]].values,fcts.calc_rmse, [0.5, 2.5, 50, 97.5, 99.5], 1000)
-    cor_b, _ = fcts.calc_bootstrap(pl[pl.columns[1]].values,pl[pl.columns[0]].values,fcts.calc_corr, [0.5, 2.5, 50, 97.5, 99.5], 1000)
+    rms_b, _ = fcts.calc_bootstrap(pl[pl.columns[1]].values,pl[pl.columns[0]].values,fcts.calc_rmse, [2.5, 50, 97.5], 1000)
+    cor_b, _ = fcts.calc_bootstrap(pl[pl.columns[1]].values,pl[pl.columns[0]].values,fcts.calc_corr, [2.5, 50, 97.5], 1000)
+    r2s_b, _ = fcts.calc_bootstrap(pl[pl.columns[1]].values,pl[pl.columns[0]].values,fcts.calc_r2ss, [2.5, 50, 97.5], 1000)
+    rms_b = rms_b.round(3); cor_b = cor_b.round(3); r2s_b = r2s_b.round(3); 
     print('RMSE bootstrap for',pl.columns[1],':',rms_b)
     print('CORR bootstrap for',pl.columns[1],':',cor_b)
+    print('R2SC bootstrap for',pl.columns[1],':',r2s_b)
     
     vmin, vmax = np.ravel(pl).min()-0.5, np.ravel(pl).max()+0.5
     bin_edges = np.linspace(vmin, vmax, 50)
@@ -825,7 +1045,7 @@ for ax, pl in zip(axes.ravel(), to_plot):
     ax.set_xlim([vmin, vmax]); ax.set_ylim([vmin, vmax])
     ax.set_xlabel(pl.columns[0]); ax.set_ylabel(pl.columns[1])
     
-    ax.text(0.1,0.85,'CORR: '+str(corr)+'\nRMSE: '+str(rmse), transform=ax.transAxes)
+    ax.text(0.1,0.85,'R2SC: '+str(r2s_b[1])+'\nCORR: '+str(cor_b[1])+'\nRMSE: '+str(rms_b[1]), transform=ax.transAxes)
     
 
 
